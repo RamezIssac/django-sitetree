@@ -4,10 +4,10 @@ import warnings
 
 from collections import defaultdict
 from copy import copy, deepcopy
+from threading import local
 
 from django.conf import settings
 from django import VERSION
-from django import template
 from django.core.cache import cache
 from django.db.models import signals
 from django.utils import six
@@ -15,20 +15,21 @@ from django.utils.http import urlquote
 from django.utils.translation import get_language
 from django.utils.encoding import python_2_unicode_compatible
 from django.template import Context
+from django.template.loader import get_template
+from django.template.base import (
+    FilterExpression, Lexer, Parser, Token, Variable, VariableDoesNotExist, TOKEN_BLOCK, UNKNOWN_SOURCE, TOKEN_TEXT,
+    TOKEN_VAR, VARIABLE_TAG_START)
 from django.template.defaulttags import url as url_tag
 
 from .utils import get_tree_model, get_tree_item_model, import_app_sitetree_module, generate_id_for
-from .settings import ALIAS_TRUNK, ALIAS_THIS_CHILDREN, ALIAS_THIS_SIBLINGS, ALIAS_THIS_PARENT_SIBLINGS,\
-    ALIAS_THIS_ANCESTOR_CHILDREN, UNRESOLVED_ITEM_MARKER
+from .settings import (
+    ALIAS_TRUNK, ALIAS_THIS_CHILDREN, ALIAS_THIS_SIBLINGS, ALIAS_THIS_PARENT_SIBLINGS, ALIAS_THIS_ANCESTOR_CHILDREN,
+    UNRESOLVED_ITEM_MARKER, RAISE_ITEMS_ERRORS_ON_DEBUG, CACHE_TIMEOUT)
 
 
 MODEL_TREE_CLASS = get_tree_model()
 MODEL_TREE_ITEM_CLASS = get_tree_item_model()
 
-
-# Sitetree objects are stored in Django cache for a year (60 * 60 * 24 * 365 = 31536000 sec).
-# Cache is only invalidated on sitetree or sitetree item change.
-CACHE_TIMEOUT = 31536000
 
 # Holds tree items processor callable or None.
 _ITEMS_PROCESSOR = None
@@ -42,6 +43,9 @@ _IDX_ORPHAN_TREES = 'orphans'
 _IDX_TPL = '%s|:|%s'
 # SiteTree app-wise object.
 _SITETREE = None
+
+_THREAD_LOCAL = local()
+_THREAD_LANG = 'sitetree_lang'
 
 
 def get_sitetree():
@@ -235,19 +239,79 @@ class LazyTitle(object):
         self.title = title
 
     def __str__(self):
-        my_lexer = template.Lexer(self.title, template.UNKNOWN_SOURCE)
+        my_lexer = Lexer(self.title, UNKNOWN_SOURCE)
         my_tokens = my_lexer.tokenize()
 
         # Deliberately strip off template tokens that are not text or variable.
         for my_token in my_tokens:
-            if my_token.token_type not in (template.TOKEN_TEXT, template.TOKEN_VAR):
+            if my_token.token_type not in (TOKEN_TEXT, TOKEN_VAR):
                 my_tokens.remove(my_token)
 
-        my_parser = template.Parser(my_tokens)
+        my_parser = Parser(my_tokens)
         return my_parser.parse().render(SiteTree.get_global_context())
 
     def __eq__(self, other):
         return self.__str__() == other
+
+
+class Cache(object):
+    """Contains cache-related stuff."""
+
+    def __init__(self):
+        self.cache = None
+
+        cache_empty = self.empty
+        # Listen for signals from the models.
+        signals.post_save.connect(cache_empty, sender=MODEL_TREE_CLASS)
+        signals.post_save.connect(cache_empty, sender=MODEL_TREE_ITEM_CLASS)
+        signals.post_delete.connect(cache_empty, sender=MODEL_TREE_ITEM_CLASS)
+        # Listen to the changes in item permissions table.
+        signals.m2m_changed.connect(cache_empty, sender=MODEL_TREE_ITEM_CLASS.access_permissions)
+
+    @classmethod
+    def reset(cls):
+        """Instructs sitetree to drop and recreate cache.
+
+        Could be used to show up tree changes made in a different process.
+
+        """
+        cache.get('sitetrees_reset', True)
+
+    def init(self):
+        """Initializes local cache from Django cache."""
+
+        # Drop cache flag set by .reset() method.
+        cache.get('sitetrees_reset') and self.empty()
+
+        cache_ = cache.get('sitetrees')
+        if cache_ is None:
+            # Init cache dictionary with predefined entries.
+            cache_ = {'sitetrees': {}, 'urls': {}, 'parents': {}, 'items_by_ids': {}, 'tree_aliases': {}}
+        self.cache = cache_
+
+    def save(self):
+        """Saves sitetree data to Django cache."""
+        cache.set('sitetrees', self.cache, CACHE_TIMEOUT)
+
+    def empty(self, **kwargs):
+        """Empties cached sitetree data."""
+        self.cache = None
+        cache.delete('sitetrees')
+        cache.delete('sitetrees_reset')
+
+    def get_entry(self, entry_name, key):
+        """Returns cache entry parameter value by its name."""
+        return self.cache[entry_name].get(key, False)
+
+    def update_entry_value(self, entry_name, key, value):
+        """Updates cache entry parameter with new data."""
+        if key not in self.cache[entry_name]:
+            self.cache[entry_name][key] = {}
+        self.cache[entry_name][key].update(value)
+
+    def set_entry(self, entry_name, key, value):
+        """Replaces entire cache entry parameter data by its name with new data."""
+        self.cache[entry_name][key] = value
 
 
 class SiteTree(object):
@@ -255,45 +319,7 @@ class SiteTree(object):
     _global_context = Context()
 
     def __init__(self):
-        self.cache = None
-        # Listen for signals from the models.
-        signals.post_save.connect(self.cache_empty, sender=MODEL_TREE_CLASS)
-        signals.post_save.connect(self.cache_empty, sender=MODEL_TREE_ITEM_CLASS)
-        signals.post_delete.connect(self.cache_empty, sender=MODEL_TREE_ITEM_CLASS)
-        # Listen to the changes in item permissions table.
-        signals.m2m_changed.connect(self.cache_empty, sender=MODEL_TREE_ITEM_CLASS.access_permissions)
-
-    def cache_init(self):
-        """Initializes local cache from Django cache."""
-        cache_ = cache.get('sitetrees')
-        if cache_ is None:
-            # Init cache dictionary with predefined entries.
-            cache_ = {'sitetrees': {}, 'urls': {}, 'parents': {}, 'items_by_ids': {}, 'tree_aliases': {}}
-        self.cache = cache_
-
-    def cache_save(self):
-        """Saves sitetree data to Django cache."""
-        cache.set('sitetrees', self.cache, CACHE_TIMEOUT)
-
-    def cache_empty(self, **kwargs):
-        """Empties cached sitetree data."""
-        self.cache = None
-        cache.delete('sitetrees')
-        cache.delete('tree_aliases')
-
-    def get_cache_entry(self, entry_name, key):
-        """Returns cache entry parameter value by its name."""
-        return self.cache[entry_name].get(key, False)
-
-    def update_cache_entry_value(self, entry_name, key, value):
-        """Updates cache entry parameter with new data."""
-        if key not in self.cache[entry_name]:
-            self.cache[entry_name][key] = {}
-        self.cache[entry_name][key].update(value)
-
-    def set_cache_entry(self, entry_name, key, value):
-        """Replaces entire cache entry parameter data by its name with new data."""
-        self.cache[entry_name][key] = value
+        self.cache = Cache()
 
     @classmethod
     def set_global_context(cls, context):
@@ -315,12 +341,12 @@ class SiteTree(object):
         If so, returns i18n alias. If not, returns the initial alias.
         """
         if alias in _I18N_TREES:
-            current_language_code = get_language().replace('_', '-').split('-')[0]
+            current_language_code = self.lang_get().replace('_', '-').split('-')[0]
             i18n_tree_alias = '%s_%s' % (alias, current_language_code)
-            trees_count = self.get_cache_entry('tree_aliases', i18n_tree_alias)
+            trees_count = self.cache.get_entry('tree_aliases', i18n_tree_alias)
             if trees_count is False:
                 trees_count = MODEL_TREE_CLASS.objects.filter(alias=i18n_tree_alias).count()
-                self.set_cache_entry('tree_aliases', i18n_tree_alias, trees_count)
+                self.cache.set_entry('tree_aliases', i18n_tree_alias, trees_count)
             if trees_count:
                 alias = i18n_tree_alias
         return alias
@@ -375,7 +401,11 @@ class SiteTree(object):
 
     def current_app_is_admin(self):
         """Returns boolean whether current application is Admin contrib."""
-        return self._global_context.current_app == 'admin'
+        current_app = (
+            getattr(self._global_context.get('request', None), 'current_app',
+                    self._global_context.current_app))
+
+        return current_app == 'admin'
 
     def get_sitetree(self, alias):
         """Gets site tree items from the given site tree.
@@ -383,33 +413,39 @@ class SiteTree(object):
         Returns (tree alias, tree items) tuple.
 
         """
-        self.cache_init()
+        # Cache aliases for speedup.
+        cache = self.cache
+        get_cache_entry = cache.get_entry
+        set_cache_entry = cache.set_entry
+
+        cache.init()
+
         sitetree_needs_caching = False
         if not self.current_app_is_admin():
             # We do not need i18n for a tree rendered in Admin dropdown.
             alias = self.resolve_tree_i18n_alias(alias)
-        sitetree = self.get_cache_entry('sitetrees', alias)
+        sitetree = get_cache_entry('sitetrees', alias)
 
         if not sitetree:
             sitetree = MODEL_TREE_ITEM_CLASS.objects.select_related('parent', 'tree').\
                    filter(tree__alias__exact=alias).order_by('parent__sort_order', 'sort_order')
             sitetree = self.attach_dynamic_tree_items(alias, sitetree)
-            self.set_cache_entry('sitetrees', alias, sitetree)
+            set_cache_entry('sitetrees', alias, sitetree)
             sitetree_needs_caching = True
 
-        parents = self.get_cache_entry('parents', alias)
+        parents = get_cache_entry('parents', alias)
         if not parents:
             parents = defaultdict(list)
             for item in sitetree:
                 parent = getattr(item, 'parent')
                 parents[parent].append(item)
-            self.set_cache_entry('parents', alias, parents)
+            set_cache_entry('parents', alias, parents)
 
         # Prepare items by ids cache if needed.
         if sitetree_needs_caching:
             # We need this extra pass to avoid future problems on items depth calculation.
             for item in sitetree:
-                self.update_cache_entry_value('items_by_ids', alias, {item.id: item})
+                cache.update_entry_value('items_by_ids', alias, {item.id: item})
 
         for item in sitetree:
             if sitetree_needs_caching:
@@ -421,11 +457,16 @@ class SiteTree(object):
 
                 # Resolve item permissions.
                 if item.access_restricted:
-                    item.perms = set([u'%s.%s' % (perm.content_type.app_label, perm.codename) for perm in
-                                               item.access_permissions.select_related()])
+                    permissions_src = (
+                        item.permissions if getattr(item, 'is_dynamic', False)
+                        else item.access_permissions.select_related())
+
+                    item.perms = set(
+                        ['%s.%s' % (perm.content_type.app_label, perm.codename) for perm in permissions_src])
+
             # Contextual properties.
             item.url_resolved = self.url(item)
-            if template.VARIABLE_TAG_START in item.title:
+            if VARIABLE_TAG_START in item.title:
                 item.title_resolved = LazyTitle(item.title)
             else:
                 item.title_resolved = item.title
@@ -437,7 +478,7 @@ class SiteTree(object):
 
         # Save sitetree data into cache if needed.
         if sitetree_needs_caching:
-            self.cache_save()
+            cache.save()
 
         return alias, sitetree
 
@@ -453,7 +494,7 @@ class SiteTree(object):
 
     def get_item_by_id(self, tree_alias, item_id):
         """Get the item from the tree by its ID."""
-        return self.get_cache_entry('items_by_ids', tree_alias)[item_id]
+        return self.cache.get_entry('items_by_ids', tree_alias)[item_id]
 
     def get_tree_current_item(self, tree_alias):
         """Resolves current tree item of 'tree_alias' tree matching current
@@ -473,7 +514,7 @@ class SiteTree(object):
         else:
             # urlquote is an attempt to support non-ascii in url.
             current_url = urlquote(self._global_context['request'].path)
-            urls_cache = self.get_cache_entry('urls', tree_alias)
+            urls_cache = self.cache.get_entry('urls', '%s%s' % (tree_alias, self.lang_get()))
             if urls_cache:
                 for url_item in urls_cache:
                     urls_cache[url_item][1].is_current = False
@@ -484,6 +525,24 @@ class SiteTree(object):
             current_item.is_current = True
 
         return current_item
+
+    @classmethod
+    def lang_get(cls):
+        """Returns language code for current thread.
+
+        :return:
+        """
+        return getattr(_THREAD_LOCAL, _THREAD_LANG, '') or cls.lang_init()
+
+    @classmethod
+    def lang_init(cls):
+        """Initializes and returns language code for current thread.
+
+        :return:
+        """
+        lang = get_language()
+        setattr(_THREAD_LOCAL, _THREAD_LANG, lang)
+        return lang
 
     def url(self, sitetree_item, context=None):
         """Resolves item's URL.
@@ -526,13 +585,14 @@ class SiteTree(object):
         else:
             url_pattern = str(sitetree_item.url)
 
-        tree_alias = sitetree_item.tree.alias
+        # i18n_patterns compatibility organized using compound cache key.
+        cache_key = '%s%s' % (sitetree_item.tree.alias, self.lang_get())
 
-        entry_from_cache = self.get_cache_entry('urls', tree_alias)
+        entry_from_cache = self.cache.get_entry('urls', cache_key)
         if not entry_from_cache:
             # Create 'cache_urls' for this tree.
             entry_from_cache = {}
-            self.set_cache_entry('urls', tree_alias, {})
+            self.cache.set_entry('urls', cache_key, {})
 
         if url_pattern in entry_from_cache:
             resolved_url = entry_from_cache[url_pattern][0]
@@ -541,8 +601,8 @@ class SiteTree(object):
                 # Form token to pass to Django 'url' tag.
                 url_token = u'url %s as item.url_resolved' % url_pattern
                 url_tag(
-                    template.Parser(None),
-                    template.Token(token_type=template.TOKEN_BLOCK, contents=url_token)
+                    Parser(None),
+                    Token(token_type=TOKEN_BLOCK, contents=url_token)
                 ).render(context)
 
                 # We make an anchor link from an unresolved URL as a reminder.
@@ -553,7 +613,7 @@ class SiteTree(object):
             else:
                 resolved_url = url_pattern
 
-            self.update_cache_entry_value('urls', tree_alias, {url_pattern: (resolved_url, sitetree_item)})
+            self.cache.update_entry_value('urls', cache_key, {url_pattern: (resolved_url, sitetree_item)})
 
         return resolved_url
 
@@ -565,6 +625,8 @@ class SiteTree(object):
         """
         # Current context we will consider global.
         self.set_global_context(context)
+        # Initialize language to use it in current thread.
+        self.lang_init()
         # Resolve tree_alias from the context.
         tree_alias = self.resolve_var(tree_alias)
         # Get tree.
@@ -584,7 +646,7 @@ class SiteTree(object):
         current_item = self.get_tree_current_item(tree_alias)
         # Current item is unresolved, fail silently.
         if current_item is None:
-            if settings.DEBUG:
+            if settings.DEBUG and RAISE_ITEMS_ERRORS_ON_DEBUG:
                 raise SiteTreeError(
                     'Unable to resolve current sitetree item to get a `%s` for current page. Check whether '
                     'there is an appropriate sitetree item defined for current URL.' % attr_name)
@@ -727,7 +789,7 @@ class SiteTree(object):
         tree_items = self.apply_hook(tree_items, '%s.children' % navigation_type)
         tree_items = self.update_has_children(tree_alias, tree_items, navigation_type)
 
-        my_template = template.loader.get_template(use_template)
+        my_template = get_template(use_template)
         context.update({'sitetree_items': tree_items})
         return my_template.render(context)
 
@@ -735,7 +797,7 @@ class SiteTree(object):
         if not self.current_app_is_admin():
             # We do not need i18n for a tree rendered in Admin dropdown.
             tree_alias = self.resolve_tree_i18n_alias(tree_alias)
-        return self.get_cache_entry('parents', tree_alias)[item]
+        return self.cache.get_entry('parents', tree_alias)[item]
 
     def update_has_children(self, tree_alias, tree_items, navigation_type):
         """Updates 'has_children' attribute for tree items."""
@@ -797,14 +859,14 @@ class SiteTree(object):
         if context is None:
             context = self._global_context
 
-        if isinstance(varname, template.FilterExpression):
+        if isinstance(varname, FilterExpression):
             varname = varname.resolve(context)
         else:
             varname = varname.strip()
 
             try:
-                varname = template.Variable(varname).resolve(context)
-            except template.VariableDoesNotExist:
+                varname = Variable(varname).resolve(context)
+            except VariableDoesNotExist:
                 varname = varname
 
         return varname

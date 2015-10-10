@@ -3,8 +3,30 @@ django-sitetree changelog
 
 Unreleased
 ----------
-+ Implemented django-smuggler thirdparty support.
-* Fix menu alias clash with context variable (closes #117).
++ Added Norwegian translation.
++ Added SITETREE_RAISE_ITEMS_ERRORS_ON_DEBUG setting (see #157).
++ Exposed SITETREE_CACHE_TIMEOUT setting.
+* Fixed cache problems when using sitetree_resync_apps  (see #135, #166).
+* Fixed disappearing tree items for guests in Admin contrib (Django 1.8) (see #164).
+* Fix deprecation warning in Django 1.8 (see #178).
+
+
+Unreleased
+----------
+* Fixed permissions check for dynamic tree items (see #165).
+
+
+v1.4.0
+------
++ Introduced Django 1.8 support (see #152).
+* Fixed extra spaces issue in breadcrumbs (closes #150).
+
+
+v1.3.0
+------
++ Implemented `django-smuggler` thirdparty support.
++ Implemented `i18n_patterns` compatibility (closes #148).
+* Fixed menu alias clash with context variable (closes #117).
 
 
 v1.2.1

@@ -2,7 +2,8 @@ Getting started
 ===============
 
 1. Add the **sitetree** application to INSTALLED_APPS in your settings file (usually 'settings.py').
-2. Check that *django.core.context_processors.request* is enabled in TEMPLATE_CONTEXT_PROCESSORS in your settings file.
+2. Check that *django.core.context_processors.request* is added to TEMPLATE_CONTEXT_PROCESSORS in your settings file.
+   For Django 1.8+: *django.template.context_processors.request* should be defined in ``TEMPLATES/OPTIONS/context_processors``.
 3. Check that *django.contrib.auth.context_processors.auth* is enabled in TEMPLATE_CONTEXT_PROCESSORS too.
 4. Run ``./manage.py syncdb`` to install sitetree tables into database (``./manage.py migrate`` for Django 1.7+).
 
@@ -35,7 +36,7 @@ Making tree
 
 Taken from `StackOverflow <http://stackoverflow.com/questions/4766807/how-to-use-django-sitetree/4887916#4887916>`_.
 
-In this tutoral we create sitetree that could handle URI like */categoryname/entryname*.
+In this tutorial we create sitetree that could handle URI like */categoryname/entryname*.
 
 ------------
 
@@ -68,7 +69,7 @@ To create a tree:
     In 'Additional settings': check 'URL as Pattern' checkbox.
 
 8. Put '{% load sitetree %}' into yor template to have access to sitetree tags.
-9. Put '{% sitetree_menu from "maintree" %}' into your template to render menu.
+9. Put '{% sitetree_menu from "maintree" include "trunk" %}' into your template to render menu from tree trunk.
 10. Put '{% sitetree_breadcrumbs from "maintree" %}' into your template to render breadcrumbs.
 
 ------------

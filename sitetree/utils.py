@@ -1,8 +1,12 @@
 from django.contrib.auth.models import Permission
 from django.core.exceptions import ImproperlyConfigured
 from django.utils import six
-from django.utils.importlib import import_module
 from django.utils.module_loading import module_has_submodule
+
+try:
+    from importlib import import_module
+except ImportError:  # Python < 2.7
+    from django.utils.importlib import import_module
 
 try:
     from django.apps import apps
@@ -87,7 +91,9 @@ def item(title, url, children=None, url_as_pattern=True, hint='', alias='', desc
                 try:
                     app, codename = perm.split('.')
                 except ValueError:
-                    raise ValueError('Wrong permission string format: supplied - `%s`; expected - `<app_name>.<permission_name>`.' % perm)
+                    raise ValueError(
+                        'Wrong permission string format: supplied - `%s`; '
+                        'expected - `<app_name>.<permission_name>`.' % perm)
 
                 try:
                     perm = Permission.objects.get(codename=codename, content_type__app_label=app)

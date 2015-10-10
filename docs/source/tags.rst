@@ -168,3 +168,16 @@ Usage example::
   {% sitetree_page_description from "mytree" %}
 
 This command renders current page description from tree named 'mytree'.
+
+
+
+.. _tag-ignore-errors:
+
+SITETREE_RAISE_ITEMS_ERRORS_ON_DEBUG
+------------------------------------
+
+DEFAULT: True
+
+There are some rare occasions when you want to turn off errors that are thrown by sitetree even during debug.
+
+Setting SITETREE_RAISE_ITEMS_ERRORS_ON_DEBUG = False will turn them off.
